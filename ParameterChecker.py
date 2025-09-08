@@ -370,34 +370,169 @@ class ParameterChecker:
         return invalid_rows
 
     def _evaluate_condition(self, condition: str, current_params: Dict[str, Any]) -> bool:
-        """评估条件表达式是否成立"""
+        """评估复杂条件表达式，支持AND/OR和多种比较运算符"""
         if not condition:
             return True
 
         try:
-            # 支持多条件用逗号分隔（逻辑与关系）
-            conditions = [cond.strip() for cond in condition.split(',') if cond.strip()]
-            if not conditions:
-                return True
-
-            # 所有条件都必须满足
-            for cond in conditions:
-                if '=' in cond:
-                    param_name, expected_value = cond.split('=', 1)
-                    param_name = param_name.strip()
-                    expected_value = self._convert_to_proper_type(expected_value.strip())
-                    current_value = current_params.get(param_name, '')
-                    # 转换当前值为合适的类型进行比较
-                    current_value = self._convert_to_proper_type(str(current_value).strip())
-
-                    if current_value != expected_value:
-                        return False
-                else:
-                    return False  # 不包含=的条件视为无效条件
-
-            return True
+            # 支持复杂条件表达式解析
+            return self._parse_complex_condition(condition, current_params)
         except Exception as e:
             logger.error(f"评估条件表达式错误: {condition}, 错误: {str(e)}")
+            return False
+            
+    def _parse_complex_condition(self, condition: str, current_params: Dict[str, Any]) -> bool:
+        """解析复杂条件表达式，支持（参数吇1=值1and参数吇2=值2）or（参数吇3>值3and参数吇2!=值2）格式"""
+        condition = condition.strip()
+        if not condition:
+            return True
+        
+        # 处理OR逻辑（优先级最低）
+        if 'or' in condition.lower():
+            # 将or分割为多个部分，只要有一个为true即可
+            or_parts = self._split_condition_by_operator(condition, 'or')
+            for part in or_parts:
+                if self._parse_complex_condition(part.strip(), current_params):
+                    return True
+            return False
+        
+        # 处理AND逻辑
+        if 'and' in condition.lower():
+            # 将and分割为多个部分，所有部分都必须为true
+            and_parts = self._split_condition_by_operator(condition, 'and')
+            for part in and_parts:
+                if not self._parse_complex_condition(part.strip(), current_params):
+                    return False
+            return True
+        
+        # 处理括号
+        if '(' in condition and ')' in condition:
+            return self._evaluate_parentheses_condition(condition, current_params)
+        
+        # 处理单个条件表达式
+        return self._evaluate_single_condition(condition, current_params)
+    
+    def _split_condition_by_operator(self, condition: str, operator: str) -> List[str]:
+        """按运算符分割条件，考虑括号嵌套"""
+        parts = []
+        current_part = ""
+        paren_count = 0
+        i = 0
+        
+        while i < len(condition):
+            char = condition[i]
+            if char == '(':
+                paren_count += 1
+            elif char == ')':
+                paren_count -= 1
+            
+            # 检查是否匹配运算符
+            if paren_count == 0 and condition[i:].lower().startswith(operator.lower()):
+                # 确保运算符两侧都有空格或是字符串边界
+                op_len = len(operator)
+                if (i == 0 or not condition[i-1].isalnum()) and \
+                   (i + op_len >= len(condition) or not condition[i + op_len].isalnum()):
+                    parts.append(current_part.strip())
+                    current_part = ""
+                    i += op_len
+                    continue
+            
+            current_part += char
+            i += 1
+        
+        if current_part.strip():
+            parts.append(current_part.strip())
+        
+        return [part for part in parts if part]
+    
+    def _evaluate_parentheses_condition(self, condition: str, current_params: Dict[str, Any]) -> bool:
+        """处理包含括号的条件表达式"""
+        # 找到最内层的括号
+        while '(' in condition:
+            start = -1
+            for i, char in enumerate(condition):
+                if char == '(':
+                    start = i
+                elif char == ')' and start != -1:
+                    # 找到一对括号
+                    inner_condition = condition[start + 1:i]
+                    inner_result = self._parse_complex_condition(inner_condition, current_params)
+                    # 用结果替换括号表达式
+                    condition = condition[:start] + str(inner_result).lower() + condition[i + 1:]
+                    break
+        
+        # 现在条件中应该只包含true/false和AND/OR运算符
+        return self._parse_complex_condition(condition, current_params)
+    
+    def _evaluate_single_condition(self, condition: str, current_params: Dict[str, Any]) -> bool:
+        """评估单个条件表达式，支持=, !=, >, <, >=, <=运算符"""
+        condition = condition.strip()
+        
+        # 处理boolean值
+        if condition.lower() == 'true':
+            return True
+        elif condition.lower() == 'false':
+            return False
+        
+        # 支持的运算符（按优先级排列）
+        operators = ['!=', '>=', '<=', '>', '<', '=']
+        
+        for op in operators:
+            if op in condition:
+                parts = condition.split(op, 1)
+                if len(parts) == 2:
+                    param_name = parts[0].strip()
+                    expected_value = parts[1].strip()
+                    
+                    # 获取当前值
+                    current_value = current_params.get(param_name, '')
+                    
+                    # 类型转换
+                    expected_value = self._convert_to_proper_type(expected_value)
+                    current_value = self._convert_to_proper_type(str(current_value).strip())
+                    
+                    # 执行比较
+                    return self._compare_values(current_value, expected_value, op)
+                    
+        return False
+    
+    def _compare_values(self, current_value: Any, expected_value: Any, operator: str) -> bool:
+        """比较两个值根据指定运算符"""
+        try:
+            if operator == '=':
+                return current_value == expected_value
+            elif operator == '!=':
+                return current_value != expected_value
+            elif operator in ['>', '<', '>=', '<=']:
+                # 对于数值比较，尝试转换为数字
+                try:
+                    current_num = float(current_value) if current_value != '' else 0
+                    expected_num = float(expected_value) if expected_value != '' else 0
+                    
+                    if operator == '>':
+                        return current_num > expected_num
+                    elif operator == '<':
+                        return current_num < expected_num
+                    elif operator == '>=':
+                        return current_num >= expected_num
+                    elif operator == '<=':
+                        return current_num <= expected_num
+                except (ValueError, TypeError):
+                    # 如果无法转换为数字，就使用字符串比较
+                    current_str = str(current_value)
+                    expected_str = str(expected_value)
+                    
+                    if operator == '>':
+                        return current_str > expected_str
+                    elif operator == '<':
+                        return current_str < expected_str
+                    elif operator == '>=':
+                        return current_str >= expected_str
+                    elif operator == '<=':
+                        return current_str <= expected_str
+            
+            return False
+        except Exception:
             return False
 
     def _process_multi_value_param(self, tmp: pd.DataFrame, param_info: Dict[str, Any],
@@ -537,6 +672,11 @@ class ParameterChecker:
 
         return all_errors
 
+    def create_sample_excel_legacy(self, file_path: str = '参数知识库_老版本.xlsx') -> None:
+        """创建老版本示例参数知识库Excel文件"""
+        # 老版本代码保留作为参考
+        pass
+        
     def create_sample_excel(self, file_path: str = '参数知识库.xlsx') -> None:
         """创建示例参数知识库Excel文件，包含完整配置规则说明"""
         # 创建示例数据，展示三种配置场景
