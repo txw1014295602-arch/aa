@@ -381,6 +381,154 @@ class ParameterChecker:
             logger.error(f"评估条件表达式错误: {condition}, 错误: {str(e)}")
             return False
             
+    def execute_validation_rule(self, rule_id: str, groups: Dict[str, pd.DataFrame], sector_id: str) -> List[Dict[str, Any]]:
+        """执行单个验证规则，支持嵌套调用"""
+        if not hasattr(self, 'validation_rules') or rule_id not in self.validation_rules:
+            logger.warning(f"验证规则 {rule_id} 不存在")
+            return []
+        
+        rule = self.validation_rules[rule_id]
+        errors = []
+        
+        # 根据校验类型执行不同的验证
+        if rule["check_type"] == "漏配":
+            errors.extend(self._check_missing_config(rule, groups, sector_id))
+        elif rule["check_type"] == "错配":
+            errors.extend(self._check_incorrect_config(rule, groups, sector_id))
+        
+        # 如果当前规则通过且有继续校验，执行继续校验
+        if not errors and rule.get("next_check"):
+            logger.info(f"规则 {rule_id} 通过，执行继续校验: {rule['next_check']}")
+            errors.extend(self.execute_validation_rule(rule["next_check"], groups, sector_id))
+        
+        return errors
+    
+    def _check_missing_config(self, rule: Dict[str, Any], groups: Dict[str, pd.DataFrame], sector_id: str) -> List[Dict[str, Any]]:
+        """检查漏配问题"""
+        mo_name = rule["mo_name"]
+        param_name = rule["param_name"]
+        expected_value = rule["expected_value"]
+        condition = rule.get("condition", "")
+        
+        errors = []
+        
+        if mo_name not in groups:
+            errors.append({
+                'sector_id': sector_id,
+                'mo_name': mo_name,
+                'param_name': param_name,
+                'error_type': '数据不存在',
+                'message': f'{mo_name}数据不存在',
+                'rule_id': rule["rule_id"],
+                'error_description': rule.get("error_description", "")
+            })
+            return errors
+        
+        mo_data = groups[mo_name]
+        
+        # 没有条件时，直接检查是否存在指定值的记录
+        if not condition:
+            if param_name not in mo_data.columns:
+                errors.append({
+                    'sector_id': sector_id,
+                    'mo_name': mo_name,
+                    'param_name': param_name,
+                    'error_type': '列不存在',
+                    'message': f'{mo_name}中不存在{param_name}列',
+                    'rule_id': rule["rule_id"],
+                    'error_description': rule.get("error_description", "")
+                })
+                return errors
+            
+            # 检查是否存在指定值的记录
+            matching_records = mo_data[mo_data[param_name] == expected_value]
+            if len(matching_records) == 0:
+                errors.append({
+                    'sector_id': sector_id,
+                    'mo_name': mo_name,
+                    'param_name': param_name,
+                    'error_type': '漏配',
+                    'message': f'不存在{param_name}值为"{expected_value}"的记录',
+                    'current_value': None,
+                    'expected_value': expected_value,
+                    'rule_id': rule["rule_id"],
+                    'error_description': rule.get("error_description", "")
+                })
+        
+        return errors
+    
+    def _check_incorrect_config(self, rule: Dict[str, Any], groups: Dict[str, pd.DataFrame], sector_id: str) -> List[Dict[str, Any]]:
+        """检查错配问题"""
+        mo_name = rule["mo_name"]
+        param_name = rule["param_name"]
+        expected_value = rule["expected_value"]
+        condition = rule.get("condition", "")
+        
+        errors = []
+        
+        if mo_name not in groups or param_name not in groups[mo_name].columns:
+            return errors  # 数据不存在时不报错配错误
+        
+        mo_data = groups[mo_name]
+        
+        # 遍历所有记录，检查错配
+        for _, row in mo_data.iterrows():
+            row_params = row.to_dict()
+            converted_params = {k: self._convert_to_proper_type(str(v).strip()) for k, v in row_params.items()}
+            
+            # 如果有条件，先检查条件
+            if condition and not self._evaluate_condition(condition, converted_params):
+                continue  # 不符合条件的记录不检查
+            
+            # 检查参数值是否错误
+            current_value = converted_params.get(param_name, '')
+            
+            # 处理多值参数（开关组合）
+            if ':' in expected_value and '&' in expected_value:
+                # 多值参数验证
+                expected_switches = self._parse_multi_value(expected_value)
+                current_switches = self._parse_multi_value(str(current_value))
+                
+                switch_errors = []
+                for switch_name, expected_state in expected_switches.items():
+                    current_state = current_switches.get(switch_name, '')
+                    if current_state != expected_state:
+                        switch_errors.append({
+                            'switch_name': switch_name,
+                            'current_state': current_state,
+                            'expected_state': expected_state
+                        })
+                
+                if switch_errors:
+                    errors.append({
+                        'sector_id': sector_id,
+                        'mo_name': mo_name,
+                        'param_name': param_name,
+                        'error_type': '错配',
+                        'message': f'{param_name}开关组合错误',
+                        'switch_errors': switch_errors,
+                        'condition': condition,
+                        'rule_id': rule["rule_id"],
+                        'error_description': rule.get("error_description", "")
+                    })
+            else:
+                # 单值参数验证
+                if current_value != expected_value:
+                    errors.append({
+                        'sector_id': sector_id,
+                        'mo_name': mo_name,
+                        'param_name': param_name,
+                        'error_type': '错配',
+                        'message': f'{param_name}值不符合期望',
+                        'current_value': current_value,
+                        'expected_value': expected_value,
+                        'condition': condition,
+                        'rule_id': rule["rule_id"],
+                        'error_description': rule.get("error_description", "")
+                    })
+        
+        return errors
+            
     def _parse_complex_condition(self, condition: str, current_params: Dict[str, Any]) -> bool:
         """解析复杂条件表达式，支持（参数吇1=值1and参数吇2=值2）or（参数吇3>值3and参数吇2!=值2）格式"""
         condition = condition.strip()
