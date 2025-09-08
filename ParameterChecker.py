@@ -6,14 +6,6 @@ from typing import Dict, List, Any, Optional, Set
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-import pandas as pd
-import logging
-from typing import Dict, List, Any, Optional, Set
-
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
 
 # 初始化错误列表
 errors = []
@@ -58,7 +50,7 @@ class ParameterChecker:
             self.parameter_knowledge = {}
 
             # 按MO名称和参数名称双层分组
-            for (mo_name, param_name), param_group in df.groupby(['MO名称', '参数名称']):
+            for (mo_name, param_name), param_group in df.groupby(['MO名称', '参数名称'], dropna=False):
                 # 获取参数类型
                 # 确保参数类型转换为字符串后再处理
                 param_type = str(param_group.iloc[0]['参数类型']).strip()
@@ -97,6 +89,7 @@ class ParameterChecker:
                     processed_expected = self._convert_to_proper_type(raw_expected_value)
 
                     # 确保条件表达式转换为字符串后再处理
+                for _, row in param_group.iterrows():
                     condition = row.get('条件表达式', '')
                     str_condition = str(condition).strip() if pd.notna(condition) else ''
                     param_meaning = row.get('参数含义', '')
@@ -132,20 +125,18 @@ class ParameterChecker:
                 mo_config.setdefault("mo_name", mo_name)
                 mo_config.setdefault("parameters", {})
                 
-                # 加载漏配检查配置
+                # 加载漏配检查配置 (使用第一行的数据)
+                first_row = param_group.iloc[0]
                 mo_config.setdefault("missing_config", {})
-                # 确保漏配检查字段和值是字符串类型
-                filter_field = str(row.get("漏配检查字段", param_name)).strip()
-                filter_value = str(row.get("漏配检查值", "")).strip()
+                filter_field = str(first_row.get("漏配检查字段", param_name)).strip()
+                filter_value = str(first_row.get("漏配检查值", "")).strip()
                 mo_config["missing_config"]["filter_field"] = filter_field
                 mo_config["missing_config"]["filter_value"] = filter_value
                 
                 # 加载参数验证配置
-                # 确保验证参数列表是字符串类型
-                validation_params = str(row.get("验证参数列表", "")).strip()
+                validation_params = str(first_row.get("验证参数列表", "")).strip()
                 if validation_params:
                     mo_config.setdefault("validation_params", [])
-                    # 支持分号分隔多个参数配置，增强容错处理
                     for param_str in validation_params.split("; "):
                         param_str = param_str.strip()
                         if param_str and ":" in param_str:
