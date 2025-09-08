@@ -31,4 +31,4 @@ args = "uv run python parameter_checker.py"
 
 [deployment]
 deploymentTarget = "vm"
-run = ["uv", "run", "python", "main.py"]
+run = ["uv", "run", "python", "parameter_checker.py"]

@@ -402,7 +402,8 @@ class ParameterChecker:
                 if expected_param['param_type'] == 'multiple':
                     # 多值参数检查
                     actual_value = row_dict[param_name]
-                    if not self._check_multi_value_match(actual_value, expected_param['expected_switches']):
+                    is_match, wrong_switches = self._check_multi_value_match(actual_value, expected_param['expected_switches'])
+                    if not is_match:
                         all_params_match = False
                         break
                 else:
@@ -469,7 +470,19 @@ class ParameterChecker:
                 if expected_param['param_type'] == 'multiple':
                     # 多值参数检查
                     actual_value = row_dict[param_name]
-                    if not self._check_multi_value_match(actual_value, expected_param['expected_switches']):
+                    is_match, wrong_switches = self._check_multi_value_match(actual_value, expected_param['expected_switches'])
+                    if not is_match:
+                        # 获取参数的值描述，解析每个开关的说明
+                        value_description = self._get_parameter_value_description(mo_name, param_name)
+                        switch_descriptions = self._parse_value_descriptions(value_description)
+                        
+                        # 只为错误的开关生成错误描述
+                        error_switch_descriptions = []
+                        for wrong_switch in wrong_switches:
+                            switch_name = wrong_switch['switch_name']
+                            if switch_name in switch_descriptions:
+                                error_switch_descriptions.append(f"{switch_name}: {switch_descriptions[switch_name]}")
+                        
                         errors.append({
                             'sector_id': sector_id,
                             'rule_id': rule['rule_id'],
@@ -477,9 +490,11 @@ class ParameterChecker:
                             'param_name': param_name,
                             'check_type': '错配',
                             'error_type': '错配',
-                            'message': f'{param_name}配置错误',
+                            'message': f'{param_name}开关配置错误',
                             'current_value': actual_value,
                             'expected_value': expected_param['expected_value'],
+                            'wrong_switches': wrong_switches,
+                            'switch_descriptions': error_switch_descriptions,
                             'condition': condition_expr,
                             'error_description': rule['error_description'],
                             'row_index': idx
@@ -504,10 +519,13 @@ class ParameterChecker:
         
         return errors
 
-    def _check_multi_value_match(self, actual_value: str, expected_switches: Dict[str, str]) -> bool:
-        """检查多值参数是否匹配"""
+    def _check_multi_value_match(self, actual_value: str, expected_switches: Dict[str, str]) -> Tuple[bool, List[Dict[str, str]]]:
+        """
+        检查多值参数是否匹配
+        返回: (是否匹配, 错误的开关列表)
+        """
         if not actual_value or not expected_switches:
-            return False
+            return False, []
         
         # 解析实际值中的开关状态
         actual_switches = {}
@@ -516,14 +534,51 @@ class ParameterChecker:
                 switch_name, switch_state = switch_expr.split(':', 1)
                 actual_switches[switch_name.strip()] = switch_state.strip()
         
-        # 检查每个期望的开关状态
+        # 检查每个期望的开关状态，收集错误的开关
+        wrong_switches = []
+        all_match = True
+        
         for switch_name, expected_state in expected_switches.items():
             if switch_name not in actual_switches:
-                return False
-            if actual_switches[switch_name] != expected_state:
-                return False
+                wrong_switches.append({
+                    'switch_name': switch_name,
+                    'expected_state': expected_state,
+                    'actual_state': '未配置',
+                    'error_type': '缺失'
+                })
+                all_match = False
+            elif actual_switches[switch_name] != expected_state:
+                wrong_switches.append({
+                    'switch_name': switch_name,
+                    'expected_state': expected_state,
+                    'actual_state': actual_switches[switch_name],
+                    'error_type': '错误'
+                })
+                all_match = False
         
-        return True
+        return all_match, wrong_switches
+
+    def _get_parameter_value_description(self, mo_name: str, param_name: str) -> str:
+        """获取参数的值描述"""
+        if mo_name in self.parameter_info and param_name in self.parameter_info[mo_name]['parameters']:
+            return self.parameter_info[mo_name]['parameters'][param_name].get('value_description', '')
+        return ''
+
+    def _parse_value_descriptions(self, value_description: str) -> Dict[str, str]:
+        """
+        解析值描述字符串，提取各个开关的说明
+        格式: "beam1:第一波束开关,beam2:第二波束开关,beam3:第三波束开关"
+        """
+        descriptions = {}
+        if not value_description:
+            return descriptions
+        
+        for desc_part in value_description.split(','):
+            if ':' in desc_part:
+                switch_name, switch_desc = desc_part.split(':', 1)
+                descriptions[switch_name.strip()] = switch_desc.strip()
+        
+        return descriptions
 
     def validate_sector_data(self, data_groups: Dict[str, pd.DataFrame], sector_id: str) -> List[Dict[str, Any]]:
         """验证扇区数据"""
@@ -752,9 +807,24 @@ class ParameterChecker:
                 if 'param_names' in error:
                     logger.info(f"      参数: {', '.join(error['param_names'])}")
                 logger.info(f"      错误: {error['message']}")
-                if 'current_value' in error and 'expected_value' in error:
+                
+                # 处理多值参数的开关错误详情
+                if 'wrong_switches' in error and error['wrong_switches']:
+                    logger.info(f"      开关错误详情:")
+                    for switch_error in error['wrong_switches']:
+                        logger.info(f"        - {switch_error['switch_name']}: 期望{switch_error['expected_state']}, 实际{switch_error['actual_state']}")
+                    
+                    # 显示错误开关的描述
+                    if 'switch_descriptions' in error and error['switch_descriptions']:
+                        logger.info(f"      开关说明:")
+                        for desc in error['switch_descriptions']:
+                            logger.info(f"        - {desc}")
+                
+                # 显示单值参数的期望值和实际值
+                elif 'current_value' in error and 'expected_value' in error:
                     logger.info(f"      期望值: {error['expected_value']}")
                     logger.info(f"      实际值: {error['current_value']}")
+                
                 if error.get('error_description'):
                     logger.info(f"      说明: {error['error_description']}")
                 logger.info("")
