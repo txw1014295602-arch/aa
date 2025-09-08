@@ -20,7 +20,24 @@ class ParameterChecker:
     def __init__(self, knowledge_file="参数知识库.xlsx", knowledge_sheet="空域配置"):
         """初始化参数核查器"""
         self.parameter_knowledge: Dict[str, Any] = {}
-        self.load_parameter_knowledge(knowledge_file, knowledge_sheet)
+        self.validation_rules: Dict[str, Any] = {}  # 新增：存储验证规则
+        self.knowledge_file = knowledge_file
+        
+        # 尝试加载新版本双分表结构，如果失败则回退到老版本
+        try:
+            if not self.load_new_structure(knowledge_file):
+                logger.info("新版本加载失败，回退到老版本单分表结构")
+                self.load_parameter_knowledge(knowledge_file, knowledge_sheet)
+        except Exception as e:
+            logger.error(f"初始化加载失败: {str(e)}")
+            # 确保属性被初始化
+            self.validation_rules = {}
+            self.parameter_knowledge = {}
+            # 尝试加载老版本结构
+            try:
+                self.load_parameter_knowledge(knowledge_file, knowledge_sheet)
+            except Exception:
+                pass  # 如果老版本也失败，至少保证属性存在
 
     def load_parameter_knowledge(self, file_path="参数知识库.xlsx", sheet_name="空域配置") -> bool:
         """从Excel文件中加载参数知识库，优化数值类型处理"""
@@ -819,6 +836,351 @@ class ParameterChecker:
             all_errors = pd.concat([all_errors, errors], ignore_index=True)
 
         return all_errors
+        
+    def load_new_structure(self, file_path: str) -> bool:
+        """加载新版本双分表结构的参数知识库"""
+        try:
+            # 读取参数信息表
+            try:
+                param_df = pd.read_excel(file_path, sheet_name='参数信息', dtype=str)
+            except ValueError:
+                logger.info("未找到'参数信息'分表，这不是新版本结构")
+                return False
+                
+            # 读取验证规则表
+            try:
+                rules_df = pd.read_excel(file_path, sheet_name='验证规则', dtype=str)
+            except ValueError:
+                logger.info("未找到'验证规则'分表，这不是新版本结构")
+                return False
+            
+            # 检查必要的列
+            required_param_cols = ['MO名称', '参数名称', '参数ID', '参数类型', '参数含义']
+            required_rules_cols = ['校验类型', 'MO名称', '参数名称', '条件表达式', '期望值']
+            
+            missing_param_cols = [col for col in required_param_cols if col not in param_df.columns]
+            missing_rules_cols = [col for col in required_rules_cols if col not in rules_df.columns]
+            
+            if missing_param_cols or missing_rules_cols:
+                logger.error(f"缺少必要的列: 参数信息表{missing_param_cols}, 验证规则表{missing_rules_cols}")
+                return False
+            
+            # 加载参数信息
+            self.parameter_knowledge = {}
+            for _, row in param_df.iterrows():
+                mo_name = str(row['MO名称']).strip()
+                param_name = str(row['参数名称']).strip()
+                
+                # 跳过说明行
+                if mo_name.startswith('===') or param_name.startswith('==='):
+                    continue
+                    
+                if mo_name not in self.parameter_knowledge:
+                    self.parameter_knowledge[mo_name] = {
+                        "mo_name": mo_name,
+                        "mo_description": str(row.get('MO描述', '')).strip(),
+                        "scenario": str(row.get('场景类型', '')).strip(),
+                        "parameters": {}
+                    }
+                
+                param_info = {
+                    "parameter_id": str(row['参数ID']).strip(),
+                    "parameter_name": param_name,
+                    "parameter_type": str(row['参数类型']).strip(),
+                    "parameter_description": str(row['参数含义']).strip(),
+                    "value_description": str(row.get('值描述', '')).strip()
+                }
+                
+                self.parameter_knowledge[mo_name]["parameters"][param_name] = param_info
+            
+            # 加载验证规则
+            self.validation_rules = {}
+            for _, row in rules_df.iterrows():
+                check_id = str(row.get('校验ID', '')).strip()
+                check_type = str(row['校验类型']).strip()
+                
+                # 跳过说明行或没有ID的行
+                if check_type.startswith('===') or not check_id:
+                    continue
+                
+                rule_info = {
+                    "rule_id": check_id,
+                    "check_type": check_type,  # '漏配' 或 '错配'
+                    "mo_name": str(row['MO名称']).strip(),
+                    "param_name": str(row['参数名称']).strip(),
+                    "condition": str(row.get('条件表达式', '')).strip(),
+                    "expected_value": str(row['期望值']).strip(),
+                    "next_check": str(row.get('继续校验', '')).strip(),
+                    "error_description": str(row.get('错误描述', '')).strip()
+                }
+                
+                self.validation_rules[check_id] = rule_info
+            
+            logger.info(f"新版本双分表结构加载成功: {len(self.parameter_knowledge)}个MO, {len(self.validation_rules)}个验证规则")
+            return True
+            
+        except Exception as e:
+            logger.error(f"加载新版本结构失败: {str(e)}")
+            return False
+            
+    def validate_with_new_rules(self, groups: Dict[str, pd.DataFrame], sector_id: str) -> List[Dict[str, Any]]:
+        """使用新的验证规则进行全面检查"""
+        if not self.validation_rules:
+            logger.warning("未加载验证规则，无法执行新版本验证")
+            return []
+        
+        all_errors = []
+        processed_rules = set()  # 防止无限递归
+        
+        # 找到所有入口规则（没有被其他规则的next_check引用的规则）
+        all_next_checks = {rule['next_check'] for rule in self.validation_rules.values() if rule['next_check']}
+        entry_rules = [rule_id for rule_id in self.validation_rules.keys() if rule_id not in all_next_checks]
+        
+        logger.info(f"发现 {len(entry_rules)} 个入口验证规则: {entry_rules}")
+        
+        # 执行每个入口规则及其嵌套调用链
+        for entry_rule in entry_rules:
+            errors = self.execute_validation_chain(entry_rule, groups, sector_id, processed_rules.copy())
+            all_errors.extend(errors)
+        
+        return all_errors
+    
+    def execute_validation_chain(self, rule_id: str, groups: Dict[str, pd.DataFrame], 
+                                 sector_id: str, processed_rules: set) -> List[Dict[str, Any]]:
+        """执行验证规则链（递归处理嵌套调用）"""
+        if rule_id in processed_rules:
+            logger.warning(f"检测到循环引用，跳过规则: {rule_id}")
+            return []
+            
+        if rule_id not in self.validation_rules:
+            logger.warning(f"验证规则不存在: {rule_id}")
+            return []
+        
+        processed_rules.add(rule_id)
+        rule = self.validation_rules[rule_id]
+        
+        logger.info(f"执行验证规则: {rule_id} ({rule['check_type']})")
+        
+        # 执行当前规则
+        current_errors = self.execute_single_validation_rule(rule, groups, sector_id)
+        
+        # 根据规则类型决定是否继续下一步验证
+        if rule['next_check']:
+            if rule['check_type'] == '漏配' and not current_errors:
+                # 漏配检查通过，继续下一步验证
+                logger.info(f"漏配检查通过，继续执行: {rule['next_check']}")
+                next_errors = self.execute_validation_chain(rule['next_check'], groups, sector_id, processed_rules.copy())
+                current_errors.extend(next_errors)
+            elif rule['check_type'] == '错配' and not current_errors:
+                # 错配检查通过，继续下一步验证
+                logger.info(f"错配检查通过，继续执行: {rule['next_check']}")
+                next_errors = self.execute_validation_chain(rule['next_check'], groups, sector_id, processed_rules.copy())
+                current_errors.extend(next_errors)
+            else:
+                logger.info(f"规则 {rule_id} 检查失败，不继续后续验证")
+        
+        return current_errors
+    
+    def execute_single_validation_rule(self, rule: Dict[str, Any], groups: Dict[str, pd.DataFrame], 
+                                       sector_id: str) -> List[Dict[str, Any]]:
+        """执行单个验证规则"""
+        mo_name = rule['mo_name']
+        param_name = rule['param_name']
+        check_type = rule['check_type']
+        condition = rule['condition']
+        expected_value = rule['expected_value']
+        
+        errors = []
+        
+        # 检查MO数据是否存在
+        if mo_name not in groups or groups[mo_name].empty:
+            if check_type == '漏配':
+                errors.append({
+                    'sector_id': sector_id,
+                    'rule_id': rule['rule_id'],
+                    'check_type': check_type,
+                    'mo_name': mo_name,
+                    'param_name': param_name,
+                    'error_type': '数据不存在',
+                    'message': f"{mo_name} 数据不存在，符合漏配条件",
+                    'expected_value': expected_value,
+                    'current_value': None
+                })
+            return errors
+        
+        mo_data = groups[mo_name]
+        
+        # 应用条件筛选
+        if condition:
+            try:
+                filtered_data = self.filter_data_by_condition(mo_data, condition)
+            except Exception as e:
+                logger.error(f"条件表达式解析失败 '{condition}': {str(e)}")
+                return errors
+        else:
+            filtered_data = mo_data
+        
+        if check_type == '漏配':
+            # 漏配检查：筛选后的数据中是否存在期望值
+            if param_name not in filtered_data.columns:
+                errors.append({
+                    'sector_id': sector_id,
+                    'rule_id': rule['rule_id'],
+                    'check_type': check_type,
+                    'mo_name': mo_name,
+                    'param_name': param_name,
+                    'error_type': '参数列不存在',
+                    'message': f"{mo_name} 中不存在参数列 {param_name}",
+                    'expected_value': expected_value,
+                    'current_value': None
+                })
+                return errors
+            
+            # 检查是否有匹配期望值的记录
+            matching_records = filtered_data[filtered_data[param_name].astype(str) == expected_value]
+            if matching_records.empty:
+                errors.append({
+                    'sector_id': sector_id,
+                    'rule_id': rule['rule_id'],
+                    'check_type': check_type,
+                    'mo_name': mo_name,
+                    'param_name': param_name,
+                    'error_type': '漏配',
+                    'message': rule['error_description'],
+                    'expected_value': expected_value,
+                    'current_value': None
+                })
+        
+        elif check_type == '错配':
+            # 错配检查：筛选后的数据中参数值是否错误
+            if param_name not in filtered_data.columns:
+                return errors  # 列不存在，跳过错配检查
+            
+            # 检查参数类型
+            param_info = None
+            if mo_name in self.parameter_knowledge:
+                param_info = self.parameter_knowledge[mo_name].get("parameters", {}).get(param_name)
+            
+            for idx, row in filtered_data.iterrows():
+                current_value = str(row[param_name]).strip()
+                
+                if param_info and param_info.get('parameter_type') == 'multiple':
+                    # 多值参数处理
+                    if not self.check_multi_value_match(current_value, expected_value):
+                        errors.append({
+                            'sector_id': sector_id,
+                            'rule_id': rule['rule_id'],
+                            'check_type': check_type,
+                            'mo_name': mo_name,
+                            'param_name': param_name,
+                            'error_type': '错配',
+                            'message': rule['error_description'],
+                            'expected_value': expected_value,
+                            'current_value': current_value,
+                            'value_description': param_info.get('value_description', '')
+                        })
+                else:
+                    # 单值参数处理
+                    if current_value != expected_value:
+                        errors.append({
+                            'sector_id': sector_id,
+                            'rule_id': rule['rule_id'],
+                            'check_type': check_type,
+                            'mo_name': mo_name,
+                            'param_name': param_name,
+                            'error_type': '错配',
+                            'message': rule['error_description'],
+                            'expected_value': expected_value,
+                            'current_value': current_value
+                        })
+        
+        return errors
+    
+    def filter_data_by_condition(self, data: pd.DataFrame, condition: str) -> pd.DataFrame:
+        """根据条件表达式筛选数据"""
+        if not condition:
+            return data
+        
+        # 简化的条件解析，支持基本的 AND/OR 逻辑
+        # 这里可以根据需要扩展更复杂的解析逻辑
+        try:
+            # 替换中文逻辑词
+            condition = condition.replace(' and ', ' & ').replace(' or ', ' | ')
+            condition = condition.replace('and', '&').replace('or', '|')
+            
+            # 构建查询条件
+            query_condition = self.parse_condition_to_query(condition, data)
+            
+            if query_condition:
+                return data.query(query_condition)
+            else:
+                return data
+                
+        except Exception as e:
+            logger.error(f"条件解析失败: {condition}, 错误: {str(e)}")
+            return data
+    
+    def parse_condition_to_query(self, condition: str, data: pd.DataFrame) -> str:
+        """将条件表达式转换为pandas query格式"""
+        # 这是一个简化版本，可以根据需要扩展
+        import re
+        
+        # 处理括号和逻辑运算符
+        condition = condition.replace('(', '( ').replace(')', ' )')
+        
+        # 查找所有的比较表达式
+        comparisons = re.findall(r'([^()&|]+)', condition)
+        
+        query_parts = []
+        for comp in comparisons:
+            comp = comp.strip()
+            if not comp or comp in ['&', '|']:
+                continue
+                
+            # 解析比较表达式
+            for op in ['>=', '<=', '!=', '>', '<', '=']:
+                if op in comp:
+                    param, value = comp.split(op, 1)
+                    param = param.strip()
+                    value = value.strip()
+                    
+                    # 确保参数列存在
+                    if param in data.columns:
+                        if op == '=':
+                            op = '=='
+                        query_parts.append(f"`{param}` {op} '{value}'")
+                    break
+        
+        if query_parts:
+            # 重新构建查询条件
+            query = condition
+            for i, part in enumerate(query_parts):
+                # 这里需要更复杂的逻辑来正确替换
+                pass
+            
+            # 简化处理：如果只有一个条件
+            if len(query_parts) == 1:
+                return query_parts[0]
+        
+        return ""
+    
+    def check_multi_value_match(self, current_value: str, expected_value: str) -> bool:
+        """检查多值参数是否匹配"""
+        try:
+            current_switches = self._parse_multi_value(current_value)
+            expected_switches = self._parse_multi_value(expected_value)
+            
+            # 检查所有期望的开关状态
+            for switch_name, expected_state in expected_switches.items():
+                if switch_name not in current_switches:
+                    return False
+                if current_switches[switch_name] != expected_state:
+                    return False
+            
+            return True
+            
+        except Exception:
+            return current_value == expected_value
 
     def create_sample_excel_legacy(self, file_path: str = '参数知识库_老版本.xlsx') -> None:
         """创建老版本示例参数知识库Excel文件"""
@@ -1042,7 +1404,7 @@ if __name__ == "__main__":
     checker = ParameterChecker()
 
     # 创建示例Excel文件
-    # checker.create_sample_excel()
+    checker.create_sample_excel()
 
     # 重新加载参数知识库
     checker.load_parameter_knowledge()
