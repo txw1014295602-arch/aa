@@ -298,17 +298,22 @@ class ParameterChecker:
         
         return False
 
-    def parse_expected_expression(self, expression: str) -> List[Dict[str, Any]]:
+    def parse_expected_expression(self, expression: str) -> Dict[str, Any]:
         """
         解析期望值表达式
-        支持格式: 参数名1=值1,参数名2=值2 或 参数名1=k1:开&k2:关&k3:开
+        支持格式: 
+        1. 简单格式: 参数名1=值1,参数名2=值2 或 参数名1=k1:开&k2:关&k3:开
+        2. 复杂格式: （参数名1=值1and参数名2=值2）or（参数名3>值3and参数名2!=值2）
         """
-        expected_params = []
-        
         if not expression or expression == 'nan':
-            return expected_params
+            return {'type': 'simple', 'params': []}
         
-        # 按逗号分割多个参数
+        # 检查是否是复杂表达式（包含括号和逻辑运算符）
+        if ('(' in expression and ')' in expression) or ' and ' in expression or ' or ' in expression:
+            return {'type': 'complex', 'expression': expression}
+        
+        # 简单格式：按逗号分割多个参数
+        expected_params = []
         param_expressions = [expr.strip() for expr in expression.split(',') if expr.strip()]
         
         for param_expr in param_expressions:
@@ -340,7 +345,86 @@ class ParameterChecker:
                         'expected_value': param_value
                     })
         
-        return expected_params
+        return {'type': 'simple', 'params': expected_params}
+
+    def validate_complex_expected_expression(self, expression: str, data_row: Dict[str, Any]) -> bool:
+        """
+        验证复杂的期望值表达式
+        支持格式: （参数名1=值1and参数名2=值2）or（参数名3>值3and参数名2!=值2）
+        """
+        try:
+            # 重用条件表达式解析的逻辑
+            normalized_expr = self._normalize_condition_expression(expression)
+            
+            def evaluate_single_validation(cond: str) -> bool:
+                """评估单个验证条件"""
+                cond = cond.strip()
+                
+                # 支持的运算符
+                operators = ['>=', '<=', '!=', '>', '<', '=']
+                
+                for op in operators:
+                    if op in cond:
+                        parts = cond.split(op, 1)
+                        if len(parts) == 2:
+                            param_name = parts[0].strip()
+                            expected_value = parts[1].strip()
+                            
+                            # 获取实际值
+                            actual_value = str(data_row.get(param_name, '')).strip()
+                            
+                            # 对于多值参数，需要特殊处理
+                            if '&' in expected_value and ':' in expected_value:
+                                # 多值参数验证
+                                return self._validate_multi_value_parameter(actual_value, expected_value)
+                            else:
+                                # 单值参数验证
+                                return self._compare_values(actual_value, op, expected_value)
+                
+                return False
+            
+            # 递归处理括号和逻辑运算符
+            def evaluate_expression(expr: str) -> bool:
+                expr = expr.strip()
+                
+                # 处理最内层括号
+                while '(' in expr and ')' in expr:
+                    start = expr.rfind('(')
+                    end = expr.find(')', start)
+                    if end == -1:
+                        break
+                    
+                    # 评估括号内的表达式
+                    inner_expr = expr[start+1:end]
+                    result = self._evaluate_simple_expression(inner_expr, evaluate_single_validation)
+                    
+                    # 替换括号及其内容为结果
+                    expr = expr[:start] + str(result).lower() + expr[end+1:]
+                
+                # 评估剩余表达式
+                return self._evaluate_simple_expression(expr, evaluate_single_validation)
+            
+            return evaluate_expression(normalized_expr)
+            
+        except Exception as e:
+            logger.error(f"验证复杂期望值表达式失败: {expression}, 错误: {str(e)}")
+            return False
+
+    def _validate_multi_value_parameter(self, actual_value: str, expected_value: str) -> bool:
+        """验证多值参数"""
+        if not actual_value or not expected_value:
+            return False
+        
+        # 解析期望的开关状态
+        expected_switches = {}
+        for switch_expr in expected_value.split('&'):
+            if ':' in switch_expr:
+                switch_name, switch_state = switch_expr.split(':', 1)
+                expected_switches[switch_name.strip()] = switch_state.strip()
+        
+        # 使用现有的多值匹配逻辑
+        is_match, _ = self._check_multi_value_match(actual_value, expected_switches)
+        return is_match
 
     def execute_validation_rule(self, rule_id: str, data_groups: Dict[str, pd.DataFrame], sector_id: str) -> List[Dict[str, Any]]:
         """执行单个验证规则"""
@@ -391,9 +475,9 @@ class ParameterChecker:
             return errors
         
         mo_data = data_groups[mo_name]
-        expected_params = self.parse_expected_expression(expected_expr)
+        expected_result = self.parse_expected_expression(expected_expr)
         
-        if not expected_params:
+        if expected_result['type'] == 'simple' and not expected_result['params']:
             logger.warning(f"规则 {rule['rule_id']} 没有有效的期望值表达式")
             return errors
         
@@ -409,33 +493,47 @@ class ParameterChecker:
                 continue
             
             # 检查期望值
-            all_params_match = True
-            for expected_param in expected_params:
-                param_name = expected_param['param_name']
-                
-                if param_name not in row_dict:
-                    all_params_match = False
+            if expected_result['type'] == 'complex':
+                # 复杂表达式验证
+                if self.validate_complex_expected_expression(expected_result['expression'], row_dict):
+                    found_matching_record = True
                     break
+            else:
+                # 简单表达式验证
+                all_params_match = True
+                for expected_param in expected_result['params']:
+                    param_name = expected_param['param_name']
+                    
+                    if param_name not in row_dict:
+                        all_params_match = False
+                        break
+                    
+                    if expected_param['param_type'] == 'multiple':
+                        # 多值参数检查
+                        actual_value = row_dict[param_name]
+                        is_match, wrong_switches = self._check_multi_value_match(actual_value, expected_param['expected_switches'])
+                        if not is_match:
+                            all_params_match = False
+                            break
+                    else:
+                        # 单值参数检查
+                        if row_dict[param_name] != expected_param['expected_value']:
+                            all_params_match = False
+                            break
                 
-                if expected_param['param_type'] == 'multiple':
-                    # 多值参数检查
-                    actual_value = row_dict[param_name]
-                    is_match, wrong_switches = self._check_multi_value_match(actual_value, expected_param['expected_switches'])
-                    if not is_match:
-                        all_params_match = False
-                        break
-                else:
-                    # 单值参数检查
-                    if row_dict[param_name] != expected_param['expected_value']:
-                        all_params_match = False
-                        break
-            
-            if all_params_match:
-                found_matching_record = True
-                break
+                if all_params_match:
+                    found_matching_record = True
+                    break
         
         if not found_matching_record:
-            param_names = [p['param_name'] for p in expected_params]
+            # 获取参数名称列表
+            if expected_result['type'] == 'complex':
+                import re
+                param_names = re.findall(r'([^=<>!]+)=', expected_result['expression'])
+                param_names = [name.strip() for name in param_names]
+            else:
+                param_names = [p['param_name'] for p in expected_result['params']]
+            
             errors.append({
                 'sector_id': sector_id,
                 'rule_id': rule['rule_id'],
@@ -463,9 +561,9 @@ class ParameterChecker:
             return errors  # 数据不存在时不报错配错误
         
         mo_data = data_groups[mo_name]
-        expected_params = self.parse_expected_expression(expected_expr)
+        expected_result = self.parse_expected_expression(expected_expr)
         
-        if not expected_params:
+        if expected_result['type'] == 'simple' and not expected_result['params']:
             logger.warning(f"规则 {rule['rule_id']} 没有有效的期望值表达式")
             return errors
         
@@ -479,61 +577,84 @@ class ParameterChecker:
                 continue
             
             # 检查期望值
-            for expected_param in expected_params:
-                param_name = expected_param['param_name']
-                
-                if param_name not in row_dict:
-                    continue
-                
-                if expected_param['param_type'] == 'multiple':
-                    # 多值参数检查
-                    actual_value = row_dict[param_name]
-                    is_match, wrong_switches = self._check_multi_value_match(actual_value, expected_param['expected_switches'])
-                    if not is_match:
-                        # 获取参数的值描述，解析每个开关的说明
-                        value_description = self._get_parameter_value_description(mo_name, param_name)
-                        switch_descriptions = self._parse_value_descriptions(value_description)
-                        
-                        # 只为错误的开关生成错误描述
-                        error_switch_descriptions = []
-                        for wrong_switch in wrong_switches:
-                            switch_name = wrong_switch['switch_name']
-                            if switch_name in switch_descriptions:
-                                error_switch_descriptions.append(f"{switch_name}: {switch_descriptions[switch_name]}")
-                        
-                        errors.append({
-                            'sector_id': sector_id,
-                            'rule_id': rule['rule_id'],
-                            'mo_name': mo_name,
-                            'param_name': param_name,
-                            'check_type': '错配',
-                            'error_type': '错配',
-                            'message': f'{param_name}开关配置错误',
-                            'current_value': actual_value,
-                            'expected_value': expected_param['expected_value'],
-                            'wrong_switches': wrong_switches,
-                            'switch_descriptions': error_switch_descriptions,
-                            'condition': condition_expr,
-                            'error_description': rule['error_description'],
-                            'row_index': idx
-                        })
-                else:
-                    # 单值参数检查
-                    if row_dict[param_name] != expected_param['expected_value']:
-                        errors.append({
-                            'sector_id': sector_id,
-                            'rule_id': rule['rule_id'],
-                            'mo_name': mo_name,
-                            'param_name': param_name,
-                            'check_type': '错配',
-                            'error_type': '错配',
-                            'message': f'{param_name}配置错误',
-                            'current_value': row_dict[param_name],
-                            'expected_value': expected_param['expected_value'],
-                            'condition': condition_expr,
-                            'error_description': rule['error_description'],
-                            'row_index': idx
-                        })
+            if expected_result['type'] == 'complex':
+                # 复杂表达式验证
+                if not self.validate_complex_expected_expression(expected_result['expression'], row_dict):
+                    # 复杂表达式验证失败，生成错误
+                    import re
+                    param_names = re.findall(r'([^=<>!]+)=', expected_result['expression'])
+                    param_names = [name.strip() for name in param_names]
+                    
+                    errors.append({
+                        'sector_id': sector_id,
+                        'rule_id': rule['rule_id'],
+                        'mo_name': mo_name,
+                        'param_names': param_names,
+                        'check_type': '错配',
+                        'error_type': '错配',
+                        'message': f'复杂表达式验证失败',
+                        'condition': condition_expr,
+                        'expected_expression': expected_result['expression'],
+                        'error_description': rule['error_description'],
+                        'row_index': idx
+                    })
+            else:
+                # 简单表达式验证
+                for expected_param in expected_result['params']:
+                    param_name = expected_param['param_name']
+                    
+                    if param_name not in row_dict:
+                        continue
+                    
+                    if expected_param['param_type'] == 'multiple':
+                        # 多值参数检查
+                        actual_value = row_dict[param_name]
+                        is_match, wrong_switches = self._check_multi_value_match(actual_value, expected_param['expected_switches'])
+                        if not is_match:
+                            # 获取参数的值描述，解析每个开关的说明
+                            value_description = self._get_parameter_value_description(mo_name, param_name)
+                            switch_descriptions = self._parse_value_descriptions(value_description)
+                            
+                            # 只为错误的开关生成错误描述
+                            error_switch_descriptions = []
+                            for wrong_switch in wrong_switches:
+                                switch_name = wrong_switch['switch_name']
+                                if switch_name in switch_descriptions:
+                                    error_switch_descriptions.append(f"{switch_name}: {switch_descriptions[switch_name]}")
+                            
+                            errors.append({
+                                'sector_id': sector_id,
+                                'rule_id': rule['rule_id'],
+                                'mo_name': mo_name,
+                                'param_name': param_name,
+                                'check_type': '错配',
+                                'error_type': '错配',
+                                'message': f'{param_name}开关配置错误',
+                                'current_value': actual_value,
+                                'expected_value': expected_param['expected_value'],
+                                'wrong_switches': wrong_switches,
+                                'switch_descriptions': error_switch_descriptions,
+                                'condition': condition_expr,
+                                'error_description': rule['error_description'],
+                                'row_index': idx
+                            })
+                    else:
+                        # 单值参数检查
+                        if row_dict[param_name] != expected_param['expected_value']:
+                            errors.append({
+                                'sector_id': sector_id,
+                                'rule_id': rule['rule_id'],
+                                'mo_name': mo_name,
+                                'param_name': param_name,
+                                'check_type': '错配',
+                                'error_type': '错配',
+                                'message': f'{param_name}配置错误',
+                                'current_value': row_dict[param_name],
+                                'expected_value': expected_param['expected_value'],
+                                'condition': condition_expr,
+                                'error_description': rule['error_description'],
+                                'row_index': idx
+                            })
         
         return errors
 
