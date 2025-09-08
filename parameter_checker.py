@@ -160,22 +160,21 @@ class ParameterChecker:
     def parse_condition_expression(self, expression: str, data_row: Dict[str, Any]) -> bool:
         """
         解析复杂条件表达式
-        支持格式: (参数名1=值1and参数名2=值2)or(参数名3>值3and参数名2!=值2)
+        支持格式: （参数名1=值1and参数名2=值2）or（参数名3>值3and参数名2!=值2）
         """
         if not expression or expression == 'nan':
             return True
             
         try:
-            # 替换中文逻辑运算符
-            expression = expression.replace('and', ' and ').replace('or', ' or ')
-            expression = expression.replace('且', ' and ').replace('或', ' or ')
+            # 标准化表达式：处理中文括号和操作符
+            expression = self._normalize_condition_expression(expression)
             
             # 解析单个条件
             def evaluate_single_condition(cond: str) -> bool:
                 cond = cond.strip()
                 
-                # 支持的运算符
-                operators = ['>=', '<=', '!=', '=', '>', '<']
+                # 支持的运算符（按长度降序排列避免匹配问题）
+                operators = ['>=', '<=', '!=', '>', '<', '=']
                 
                 for op in operators:
                     if op in cond:
@@ -193,12 +192,12 @@ class ParameterChecker:
                 logger.warning(f"无法解析条件: {cond}")
                 return False
             
-            # 处理括号和逻辑运算符
-            # 简化处理：先替换括号内的条件
+            # 递归处理括号和逻辑运算符
             def evaluate_expression(expr: str) -> bool:
-                # 处理括号
-                while '(' in expr:
-                    # 找到最内层括号
+                expr = expr.strip()
+                
+                # 处理最内层括号
+                while '(' in expr and ')' in expr:
                     start = expr.rfind('(')
                     end = expr.find(')', start)
                     if end == -1:
@@ -208,8 +207,8 @@ class ParameterChecker:
                     inner_expr = expr[start+1:end]
                     result = self._evaluate_simple_expression(inner_expr, evaluate_single_condition)
                     
-                    # 替换括号
-                    expr = expr[:start] + str(result) + expr[end+1:]
+                    # 替换括号及其内容为结果
+                    expr = expr[:start] + str(result).lower() + expr[end+1:]
                 
                 # 评估剩余表达式
                 return self._evaluate_simple_expression(expr, evaluate_single_condition)
@@ -219,6 +218,25 @@ class ParameterChecker:
         except Exception as e:
             logger.error(f"解析条件表达式失败: {expression}, 错误: {str(e)}")
             return False
+
+    def _normalize_condition_expression(self, expression: str) -> str:
+        """标准化条件表达式：处理中文括号和操作符"""
+        import re
+        
+        # 将中文括号转换为英文括号
+        expression = expression.replace('（', '(').replace('）', ')')
+        
+        # 在逻辑操作符前后添加空格，处理无空格的情况
+        expression = re.sub(r'(?<!\s)and(?!\s)', ' and ', expression)
+        expression = re.sub(r'(?<!\s)or(?!\s)', ' or ', expression)
+        
+        # 处理中文逻辑操作符
+        expression = expression.replace('且', ' and ').replace('或', ' or ')
+        
+        # 清理多余空格
+        expression = re.sub(r'\s+', ' ', expression)
+        
+        return expression.strip()
 
     def _evaluate_simple_expression(self, expr: str, eval_func) -> bool:
         """评估简单表达式（不含括号）"""
