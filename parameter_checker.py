@@ -55,9 +55,18 @@ class ParameterChecker:
                 return False
                 
         except FileNotFoundError:
-            logger.error(f"文件 {file_path} 不存在")
+            logger.info(f"文件 {file_path} 不存在，正在生成示例文件...")
             # 生成示例文件
             self.create_sample_excel()
+            # 重新加载
+            try:
+                param_success = self.load_parameter_info(file_path, "参数信息")
+                rule_success = self.load_validation_rules(file_path, "验证规则")
+                if param_success and rule_success:
+                    logger.info(f"示例知识库加载成功: {len(self.parameter_info)}个参数, {len(self.validation_rules)}个验证规则")
+                    return True
+            except Exception as e:
+                logger.error(f"重新加载知识库失败: {str(e)}")
             return False
         except Exception as e:
             logger.error(f"加载知识库失败: {str(e)}")
@@ -103,6 +112,8 @@ class ParameterChecker:
             logger.info(f"参数信息表加载成功: {len(self.parameter_info)} 个MO")
             return True
             
+        except FileNotFoundError:
+            raise  # 重新抛出FileNotFoundError让上层处理
         except Exception as e:
             logger.error(f"加载参数信息表失败: {str(e)}")
             return False
@@ -140,6 +151,8 @@ class ParameterChecker:
             logger.info(f"验证规则表加载成功: {len(self.validation_rules)} 个规则")
             return True
             
+        except FileNotFoundError:
+            raise  # 重新抛出FileNotFoundError让上层处理
         except Exception as e:
             logger.error(f"加载验证规则表失败: {str(e)}")
             return False

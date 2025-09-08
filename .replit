@@ -22,12 +22,12 @@ args = "Parameter Checker"
 name = "Parameter Checker"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "uv run python main.py"
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run python parameter_checker.py"
 
 [deployment]
 deploymentTarget = "vm"
