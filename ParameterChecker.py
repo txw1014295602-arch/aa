@@ -106,7 +106,6 @@ class ParameterChecker:
                     processed_expected = self._convert_to_proper_type(raw_expected_value)
 
                     # 确保条件表达式转换为字符串后再处理
-                for _, row in param_group.iterrows():
                     condition = row.get('条件表达式', '')
                     str_condition = str(condition).strip() if pd.notna(condition) else ''
                     param_meaning = row.get('参数含义', '')
